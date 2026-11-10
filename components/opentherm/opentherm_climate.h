@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esphome/core/component.h"
+#include "esphome/core/optional.h"
 #include "esphome/components/climate/climate.h"
 #include <functional>
 
@@ -10,6 +11,14 @@ namespace esphome
   {
 
     enum class ClimateType;
+
+    // Who controls the room heating (room_climate presets, only with the override option)
+    enum class RoomControl : uint8_t
+    {
+      THERMOSTAT, // frames pass through unchanged
+      TEMPORARY,  // HA setpoint until the thermostat setpoint changes
+      PERMANENT,  // HA setpoint until another preset is chosen
+    };
 
     class OpenthermClimate : public climate::Climate, public Component
     {
@@ -25,6 +34,12 @@ namespace esphome
       void set_read_only(bool read_only) { read_only_ = read_only; }
       ClimateType get_climate_type() const { return climate_type_; }
 
+      // Room override: control() hands the whole call to the gateway, which owns the state
+      void set_control_callback(std::function<void(const climate::ClimateCall &)> callback) { control_callback_ = callback; }
+      void set_override_presets(bool enabled);
+      void set_room_control_preset(RoomControl control);
+      optional<RoomControl> requested_room_control(const climate::ClimateCall &call) const;
+
       // Initialize target temperature from boiler (called once on first update)
       void initialize_target_temperature(float temperature) {
         if (!target_temperature_initialized_ && !std::isnan(temperature) && temperature > 0) {
@@ -36,9 +51,11 @@ namespace esphome
     protected:
       float default_target_temperature_{0};
       std::function<bool(float)> target_temperature_setter_;
+      std::function<void(const climate::ClimateCall &)> control_callback_;
       ClimateType climate_type_;
       bool target_temperature_initialized_{false};
       bool read_only_{false};
+      bool override_presets_{false};
     };
 
   } // namespace opentherm

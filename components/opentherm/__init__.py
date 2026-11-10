@@ -43,6 +43,12 @@ CONF_HOT_WATER_CLIMATE = "hot_water_climate"
 CONF_HEATING_WATER_CLIMATE = "heating_water_climate"
 CONF_ROOM_CLIMATE = "room_climate"
 CONF_CURRENT_TEMPERATURE_SENSOR = "current_temperature_sensor"
+CONF_OVERRIDE = "override"
+CONF_MIN_FLOW_TEMPERATURE = "min_flow_temperature"
+CONF_MAX_FLOW_TEMPERATURE = "max_flow_temperature"
+CONF_KP = "kp"
+CONF_KI = "ki"
+CONF_HYSTERESIS = "hysteresis"
 CONF_READ_SENSORS = "read_sensors"
 CONF_MESSAGE_ID = "message_id"
 CONF_IN_PIN = "in_pin"
@@ -72,6 +78,31 @@ CLIMATE_TYPES = {
     "hot_water": ClimateType.HOT_WATER,
     "heating_water": ClimateType.HEATING_WATER,
 }
+
+
+def _validate_override(config):
+    if config[CONF_MIN_FLOW_TEMPERATURE] >= config[CONF_MAX_FLOW_TEMPERATURE]:
+        raise cv.Invalid(f"{CONF_MIN_FLOW_TEMPERATURE} must be lower than {CONF_MAX_FLOW_TEMPERATURE}")
+    return config
+
+
+# Room temperature control done by the gateway while Home Assistant overrides the thermostat
+OVERRIDE_SCHEMA = cv.All(
+    # Custom climate presets live on the climate entity since ESPHome 2026.5
+    cv.require_esphome_version(2026, 5, 0),
+    cv.Schema({
+        # Flow temperature range the PI controller may ask for (°C)
+        cv.Optional(CONF_MIN_FLOW_TEMPERATURE, default=25.0): cv.float_range(min=10.0, max=90.0),
+        cv.Optional(CONF_MAX_FLOW_TEMPERATURE, default=65.0): cv.float_range(min=10.0, max=90.0),
+        # Proportional gain: °C of flow temperature per K the room is below the setpoint
+        cv.Optional(CONF_KP, default=10.0): cv.float_range(min=0.0, max=100.0),
+        # Integral gain: °C of flow temperature added per K below the setpoint per minute
+        cv.Optional(CONF_KI, default=0.5): cv.float_range(min=0.0, max=10.0),
+        # Heating stops when the room is this many K above the setpoint
+        cv.Optional(CONF_HYSTERESIS, default=0.3): cv.float_range(min=0.0, max=5.0),
+    }),
+    _validate_override,
+)
 
 # Validation schema
 CONFIG_SCHEMA = cv.Schema({
@@ -201,6 +232,8 @@ CONFIG_SCHEMA = cv.Schema({
         OpenthermClimate,
     ).extend({
         cv.Optional(CONF_CURRENT_TEMPERATURE_SENSOR): cv.use_id(sensor.Sensor),
+        # Lets Home Assistant override the thermostat; without it room_climate stays read-only
+        cv.Optional(CONF_OVERRIDE): OVERRIDE_SCHEMA,
     }),
 }).extend(cv.COMPONENT_SCHEMA)
 
@@ -334,8 +367,18 @@ async def to_code(config):
         await cg.register_component(room_var, room_conf)
         await climate.register_climate(room_var, room_conf)
         cg.add(room_var.set_climate_type(ClimateType.ROOM))
-        cg.add(room_var.set_read_only(True))
         cg.add(var.register_climate(room_var))
+        if CONF_OVERRIDE in room_conf:
+            ovr = room_conf[CONF_OVERRIDE]
+            cg.add(var.set_room_override(
+                ovr[CONF_MIN_FLOW_TEMPERATURE],
+                ovr[CONF_MAX_FLOW_TEMPERATURE],
+                ovr[CONF_KP],
+                ovr[CONF_KI],
+                ovr[CONF_HYSTERESIS],
+            ))
+        else:
+            cg.add(room_var.set_read_only(True))
         if CONF_CURRENT_TEMPERATURE_SENSOR in room_conf:
             ext_sensor = await cg.get_variable(room_conf[CONF_CURRENT_TEMPERATURE_SENSOR])
             cg.add(var.set_room_climate_external_sensor(ext_sensor))

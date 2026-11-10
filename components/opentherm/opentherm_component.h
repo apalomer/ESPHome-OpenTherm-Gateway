@@ -91,11 +91,48 @@ namespace esphome
       // Boiler lockout reset (BLOR command)
       bool sendBoilerReset();
 
+      // Home Assistant override of the thermostat (room_climate presets)
+      void set_room_override(float min_flow, float max_flow, float kp, float ki, float hysteresis);
+      void room_control(const climate::ClimateCall &call);
+
       // Process OpenTherm requests - needs to be static for the interrupt handler
       static void processRequest(unsigned long request, OpenThermResponseStatus status);
 
     protected:
       static OpenthermComponent *instance_;
+
+      // Room override: the gateway regulates the room by rewriting the thermostat's
+      // CH enable bit (Data-ID 0) and flow setpoint (Data-ID 1) before they reach the boiler
+      bool override_enabled_{false};
+      float ovr_min_flow_{25.0f};
+      float ovr_max_flow_{65.0f};
+      float ovr_kp_{10.0f};
+      float ovr_ki_{0.5f};
+      float ovr_hysteresis_{0.3f};
+      RoomControl room_control_{RoomControl::THERMOSTAT};
+      bool room_off_{false};                  // climate mode OFF: heating disabled from HA
+      float override_setpoint_{NAN};          // room setpoint requested from HA
+      float override_reference_trset_{NAN};   // thermostat setpoint when a temporary override started
+      bool thermostat_setpoint_changed_{false};
+      bool ovr_active_{false};                // frames are being rewritten
+      bool ovr_demand_{false};                // CH enable sent to the boiler
+      float ovr_flow_{NAN};                   // flow setpoint sent to the boiler
+      float pi_integral_{0.0f};
+      unsigned long last_control_ms_{0};
+      // What the thermostat itself asked for, for a bumpless start of an override
+      float thermostat_tset_{NAN};
+      bool thermostat_ch_enable_{false};
+
+      const unsigned long ROOM_TEMP_TIMEOUT_{300000};  // ignore an OpenTherm room temperature older than 5 min
+      const float OVERRIDE_OFF_FLOW_{10.0f};           // flow setpoint sent while the override wants no heat
+
+      void setRoomControl(RoomControl control);
+      void runRoomControl();
+      void publishRoomClimate(bool ch_active);
+      float overrideRoomTemperature();
+      unsigned long rewriteForBoiler(unsigned long request);
+      unsigned long restoreForThermostat(unsigned long request, unsigned long response);
+      void noteThermostatFrame(unsigned long request);
 
       // Pin configurations
       int in_pin_{4};

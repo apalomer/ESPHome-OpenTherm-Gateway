@@ -131,6 +131,10 @@ opentherm:
     name: "Room Climate"
     # Optional: use external sensor for current room temperature
     # current_temperature_sensor: living_room_temp
+    # Optional: let Home Assistant override the thermostat (see "Room override" below)
+    # override:
+    #   min_flow_temperature: 25
+    #   max_flow_temperature: 65
 
 # Optional external temperature source for room_climate current_temperature
 # sensor:
@@ -172,8 +176,41 @@ button:
 - `heating_target_temperature` sensor shows **what boiler uses**
 - Climate entity shows **what you requested**
 - Boilers with heating curves calculate water temp based on outdoor temp
-- `room_climate` is read-only and follows thermostat setpoint (TrSet)
+- `room_climate` is read-only and follows thermostat setpoint (TrSet), unless `override` is configured
 - `room_climate.current_temperature` priority: external sensor, then OpenTherm Tr
+
+### Room override
+
+Most thermostats regulate the room themselves and only send the boiler a flow temperature, so changing the room setpoint in Home Assistant has no effect on its own. With the `override` option, the gateway can take over: while an override is active it regulates the room with its own PI controller and replaces, before they reach the boiler, the CH enable bit the thermostat sends in Data-ID 0 and the flow setpoint it sends in Data-ID 1. The thermostat keeps getting answers with its own values, and hot water is not touched.
+
+```yaml
+  room_climate:
+    name: "Room Climate"
+    current_temperature_sensor: living_room_temp   # optional, otherwise the thermostat's Tr is used
+    override:
+      min_flow_temperature: 25   # °C, lowest flow setpoint while heating (default 25)
+      max_flow_temperature: 65   # °C, highest flow setpoint (default 65)
+      kp: 10                     # °C of flow per K below the setpoint (default 10)
+      ki: 0.5                    # °C of flow added per K below the setpoint per minute (default 0.5)
+      hysteresis: 0.3            # K above the setpoint at which heating stops (default 0.3)
+```
+
+The room climate entity then gets three presets:
+
+| Preset | Behaviour |
+|---|---|
+| Thermostat | Frames pass through unchanged and the entity shows the thermostat setpoint. This is the state after every boot. |
+| Temporary override | The gateway regulates to the Home Assistant setpoint until the thermostat setpoint changes (its knob or schedule), then goes back to Thermostat. |
+| Permanent override | The gateway regulates to the Home Assistant setpoint until another preset is chosen. |
+
+- Changing the temperature while on Thermostat switches to Temporary override.
+- Switching to an override preset keeps the temperature shown; switching back to Thermostat shows the thermostat setpoint again.
+- Mode Off turns central heating off from Home Assistant until the mode is set back to Heat.
+- The controller starts from the flow temperature the thermostat was asking for, so taking over doesn't cause a jump.
+- If no room temperature is available (no external sensor value and no Tr from the thermostat for 5 minutes), the override pauses and the thermostat is back in control.
+- `heating_target_temperature` shows the flow setpoint the boiler actually receives.
+
+Requires ESPHome 2026.5.0 or newer.
 
 ### Smart Caching
 

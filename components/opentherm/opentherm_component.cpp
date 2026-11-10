@@ -1,5 +1,7 @@
 #include "opentherm_component.h"
 #include "esphome/core/log.h"
+#include <algorithm>
+#include <cmath>
 
 namespace esphome
 {
@@ -105,11 +107,33 @@ namespace esphome
           ESP_LOGI(TAG, "Slave OT version: %.2f", value);
         }
       }
+
+      if (override_enabled_ && room_climate_ != nullptr)
+      {
+        room_climate_->set_override_presets(true);
+        room_climate_->set_control_callback([this](const climate::ClimateCall &call)
+                                            { this->room_control(call); });
+        ESP_LOGI(TAG, "Room override enabled: flow %.0f-%.0f°C, kp %.1f, ki %.2f/min, hysteresis %.1f K",
+                 ovr_min_flow_, ovr_max_flow_, ovr_kp_, ovr_ki_, ovr_hysteresis_);
+      }
     }
 
     void OpenthermComponent::loop()
     {
       slave_ot_->process();
+
+      // A thermostat setpoint change ends a temporary override
+      if (thermostat_setpoint_changed_)
+      {
+        thermostat_setpoint_changed_ = false;
+        if (room_control_ == RoomControl::TEMPORARY)
+        {
+          ESP_LOGI(TAG, "Thermostat setpoint changed to %.1f°C, ending temporary override", cached_room_setpoint_.value);
+          setRoomControl(RoomControl::THERMOSTAT);
+          runRoomControl();
+          publishRoomClimate(ot_->isCentralHeatingActive(last_status_response_));
+        }
+      }
 
       // Process intercepted responses (moved from interrupt context)
       if (has_new_intercepted_response_)
@@ -266,25 +290,264 @@ namespace esphome
         heating_water_climate_->publish_state();
       }
 
+      runRoomControl();
       if (room_climate_ != nullptr)
-      {
-        float room_temperature = NAN;
-        if (room_climate_external_sensor_ != nullptr && room_climate_external_sensor_->has_state())
-        {
-          room_temperature = room_climate_external_sensor_->state;
-        }
-        else if (!std::isnan(cached_room_temp_.value))
-        {
-          room_temperature = cached_room_temp_.value;
-        }
+        publishRoomClimate(is_central_heating_active);
+    }
 
-        if (!std::isnan(room_temperature))
-          room_climate_->current_temperature = room_temperature;
-        if (!std::isnan(cached_room_setpoint_.value))
-          room_climate_->target_temperature = cached_room_setpoint_.value;
-        room_climate_->action = is_central_heating_active ? climate::CLIMATE_ACTION_HEATING : climate::CLIMATE_ACTION_OFF;
-        room_climate_->publish_state();
+    void OpenthermComponent::publishRoomClimate(bool ch_active)
+    {
+      float room_temperature = NAN;
+      if (room_climate_external_sensor_ != nullptr && room_climate_external_sensor_->has_state())
+      {
+        room_temperature = room_climate_external_sensor_->state;
       }
+      else if (!std::isnan(cached_room_temp_.value))
+      {
+        room_temperature = cached_room_temp_.value;
+      }
+
+      if (!std::isnan(room_temperature))
+        room_climate_->current_temperature = room_temperature;
+
+      // Thermostat preset follows the thermostat; an override shows the HA setpoint
+      float target = room_control_ == RoomControl::THERMOSTAT ? cached_room_setpoint_.value : override_setpoint_;
+      if (!std::isnan(target))
+        room_climate_->target_temperature = target;
+      if (override_enabled_)
+        room_climate_->set_room_control_preset(room_control_);
+      room_climate_->action = ch_active ? climate::CLIMATE_ACTION_HEATING : climate::CLIMATE_ACTION_OFF;
+      room_climate_->publish_state();
+    }
+
+    void OpenthermComponent::set_room_override(float min_flow, float max_flow, float kp, float ki, float hysteresis)
+    {
+      override_enabled_ = true;
+      ovr_min_flow_ = min_flow;
+      ovr_max_flow_ = max_flow;
+      ovr_kp_ = kp;
+      ovr_ki_ = ki;
+      ovr_hysteresis_ = hysteresis;
+    }
+
+    void OpenthermComponent::room_control(const climate::ClimateCall &call)
+    {
+      if (call.get_mode().has_value())
+      {
+        climate::ClimateMode mode = *call.get_mode();
+        bool off = mode == climate::CLIMATE_MODE_OFF;
+        if (off != room_off_)
+        {
+          ESP_LOGI(TAG, "Room heating %s from Home Assistant", off ? "switched off" : "switched back on");
+          room_off_ = off;
+          ovr_active_ = false; // restart the controller cleanly
+        }
+        room_climate_->mode = mode;
+      }
+
+      optional<RoomControl> preset = room_climate_->requested_room_control(call);
+      if (preset.has_value())
+        setRoomControl(*preset);
+
+      if (call.get_target_temperature().has_value())
+      {
+        override_setpoint_ = *call.get_target_temperature();
+        ESP_LOGI(TAG, "Room setpoint from Home Assistant: %.1f°C", override_setpoint_);
+        // Changing the temperature while following the thermostat starts a temporary override
+        if (room_control_ == RoomControl::THERMOSTAT)
+          setRoomControl(RoomControl::TEMPORARY);
+      }
+
+      runRoomControl();
+      publishRoomClimate(ot_->isCentralHeatingActive(last_status_response_));
+    }
+
+    void OpenthermComponent::setRoomControl(RoomControl control)
+    {
+      if (control == room_control_)
+        return;
+
+      static const char *const names[] = {"thermostat", "temporary override", "permanent override"};
+      ESP_LOGI(TAG, "Room control: %s -> %s", names[static_cast<int>(room_control_)], names[static_cast<int>(control)]);
+
+      if (control == RoomControl::THERMOSTAT)
+      {
+        override_setpoint_ = NAN; // the entity shows the thermostat setpoint again
+      }
+      else
+      {
+        // Keep the temperature the entity shows (the thermostat's when coming from the thermostat preset)
+        if (std::isnan(override_setpoint_))
+          override_setpoint_ = !std::isnan(cached_room_setpoint_.value) ? cached_room_setpoint_.value
+                                                                        : room_climate_->target_temperature;
+        if (control == RoomControl::TEMPORARY)
+          override_reference_trset_ = cached_room_setpoint_.value;
+      }
+
+      if (room_control_ == RoomControl::THERMOSTAT || control == RoomControl::THERMOSTAT)
+        ovr_active_ = false; // start or stop rewriting cleanly
+
+      room_control_ = control;
+    }
+
+    float OpenthermComponent::overrideRoomTemperature()
+    {
+      if (room_climate_external_sensor_ != nullptr && room_climate_external_sensor_->has_state() &&
+          !std::isnan(room_climate_external_sensor_->state))
+        return room_climate_external_sensor_->state;
+
+      if (!std::isnan(cached_room_temp_.value) && millis() - cached_room_temp_.last_update < ROOM_TEMP_TIMEOUT_)
+        return cached_room_temp_.value;
+
+      return NAN;
+    }
+
+    void OpenthermComponent::runRoomControl()
+    {
+      if (!override_enabled_)
+        return;
+
+      if (!room_off_ && room_control_ == RoomControl::THERMOSTAT)
+      {
+        if (ovr_active_)
+          ESP_LOGI(TAG, "Room override stopped, thermostat frames pass through unchanged");
+        ovr_active_ = false;
+        return;
+      }
+
+      unsigned long now = millis();
+
+      if (room_off_)
+      {
+        if (!ovr_active_)
+          ESP_LOGI(TAG, "Room override: heating off");
+        ovr_active_ = true;
+        ovr_demand_ = false;
+        ovr_flow_ = NAN;
+        last_control_ms_ = now;
+        return;
+      }
+
+      float room = overrideRoomTemperature();
+      if (std::isnan(room) || std::isnan(override_setpoint_))
+      {
+        if (ovr_active_)
+          ESP_LOGW(TAG, "Room override paused: no room temperature, thermostat back in control");
+        ovr_active_ = false;
+        return;
+      }
+
+      float error = override_setpoint_ - room;
+      float span = ovr_max_flow_ - ovr_min_flow_;
+
+      if (!ovr_active_)
+      {
+        // Bumpless start: continue from the flow temperature the thermostat was asking for
+        pi_integral_ = 0.0f;
+        if (thermostat_ch_enable_ && !std::isnan(thermostat_tset_))
+          pi_integral_ = thermostat_tset_ - ovr_min_flow_ - ovr_kp_ * error;
+        pi_integral_ = std::max(0.0f, std::min(span, pi_integral_));
+        ovr_demand_ = error > 0.0f;
+        last_control_ms_ = now;
+        ovr_active_ = true;
+        ESP_LOGI(TAG, "Room override active: setpoint %.1f°C, room %.1f°C", override_setpoint_, room);
+      }
+
+      float dt_min = (now - last_control_ms_) / 60000.0f;
+      last_control_ms_ = now;
+
+      // Hysteresis: stop above setpoint + hysteresis, start again once below the setpoint
+      if (error <= -ovr_hysteresis_)
+        ovr_demand_ = false;
+      else if (error > 0.0f)
+        ovr_demand_ = true;
+
+      if (!ovr_demand_)
+      {
+        ovr_flow_ = NAN;
+        ESP_LOGD(TAG, "Room override: room %.2f°C, setpoint %.1f°C, no heat demand", room, override_setpoint_);
+        return;
+      }
+
+      float proportional = ovr_kp_ * error;
+      float output = ovr_min_flow_ + proportional + pi_integral_;
+      float delta = ovr_ki_ * error * dt_min;
+      // Anti-windup: don't integrate further into a saturated output
+      bool winding_up = (output >= ovr_max_flow_ && delta > 0.0f) || (output <= ovr_min_flow_ && delta < 0.0f);
+      if (!winding_up)
+        pi_integral_ = std::max(0.0f, std::min(span, pi_integral_ + delta));
+
+      output = ovr_min_flow_ + proportional + pi_integral_;
+      ovr_flow_ = std::max(ovr_min_flow_, std::min(ovr_max_flow_, output));
+      ESP_LOGD(TAG, "Room override: room %.2f°C, setpoint %.1f°C, flow %.1f°C (P %.1f, I %.1f)",
+               room, override_setpoint_, ovr_flow_, proportional, pi_integral_);
+    }
+
+    void OpenthermComponent::noteThermostatFrame(unsigned long request)
+    {
+      OpenThermMessageType type = ot_->getMessageType(request);
+      OpenThermMessageID id = ot_->getDataID(request);
+
+      if (id == OpenThermMessageID::Status && type == OpenThermMessageType::READ_DATA)
+      {
+        thermostat_ch_enable_ = (request & 0x0100) != 0;
+      }
+      else if (id == OpenThermMessageID::TSet && type == OpenThermMessageType::WRITE_DATA)
+      {
+        thermostat_tset_ = ot_->getFloat(request);
+      }
+      else if (id == OpenThermMessageID::TrSet && type == OpenThermMessageType::WRITE_DATA &&
+               room_control_ == RoomControl::TEMPORARY)
+      {
+        float trset = ot_->getFloat(request);
+        if (std::isnan(override_reference_trset_))
+          override_reference_trset_ = trset; // first value seen since the override started
+        else if (std::fabs(trset - override_reference_trset_) >= 0.05f)
+          thermostat_setpoint_changed_ = true; // handled in loop()
+      }
+    }
+
+    unsigned long OpenthermComponent::rewriteForBoiler(unsigned long request)
+    {
+      if (!ovr_active_)
+        return request;
+
+      OpenThermMessageType type = ot_->getMessageType(request);
+      OpenThermMessageID id = ot_->getDataID(request);
+      unsigned int data = request & 0xFFFF;
+
+      // Data-ID 0: master status, CH enable is bit 0 of the high byte. DHW and the other bits stay as sent.
+      if (id == OpenThermMessageID::Status && type == OpenThermMessageType::READ_DATA)
+      {
+        unsigned int new_data = ovr_demand_ ? (data | 0x0100) : (data & ~0x0100u);
+        return new_data == data ? request : ot_->buildRequest(type, id, new_data);
+      }
+
+      // Data-ID 1: CH flow setpoint
+      if (id == OpenThermMessageID::TSet && type == OpenThermMessageType::WRITE_DATA)
+      {
+        float flow = ovr_demand_ && !std::isnan(ovr_flow_) ? ovr_flow_ : OVERRIDE_OFF_FLOW_;
+        return ot_->buildRequest(type, id, ot_->temperatureToData(flow));
+      }
+
+      return request;
+    }
+
+    unsigned long OpenthermComponent::restoreForThermostat(unsigned long request, unsigned long response)
+    {
+      // Answer the thermostat with its own values, so it doesn't see what the gateway changed
+      OpenThermMessageType type = ot_->getMessageType(response);
+      OpenThermMessageID id = ot_->getDataID(response);
+      unsigned int data = response & 0xFFFF;
+
+      if (id == OpenThermMessageID::Status)
+        data = (request & 0xFF00) | (data & 0x00FF); // echo the thermostat's master status, keep the boiler status
+      else if (id == OpenThermMessageID::TSet && type == OpenThermMessageType::WRITE_ACK)
+        data = request & 0xFFFF;
+      else
+        return response;
+
+      return slave_ot_->buildResponse(type, id, data);
     }
 
     void OpenthermComponent::register_climate(OpenthermClimate *climate)
@@ -455,17 +718,27 @@ namespace esphome
         return;
       }
 
-      unsigned long response = instance_->ot_->sendRequest(request);
+      instance_->noteThermostatFrame(request);
+
+      // During a room override the CH enable bit and the flow setpoint are replaced before they reach the boiler
+      unsigned long forwarded = instance_->rewriteForBoiler(request);
+      unsigned long response = instance_->ot_->sendRequest(forwarded);
       // 0 = boiler did not answer, bad parity = noise; let the thermostat time out instead of relaying garbage
       if (response != 0 && !instance_->ot_->parity(response))
-        instance_->slave_ot_->sendResponse(response);
+      {
+        unsigned long reply = forwarded != request ? instance_->restoreForThermostat(request, response) : response;
+        instance_->slave_ot_->sendResponse(reply);
+      }
       instance_->last_relay_ms_ = millis();
 
       OpenThermMessageID id = instance_->ot_->getDataID(request);
       OpenThermMessageType msg_type = instance_->ot_->getMessageType(request);
       bool valid = instance_->ot_->isValidResponse(response);
 
-      ESP_LOGV(TAG, "Relayed 0x%08lX -> 0x%08lX", request, response);
+      if (forwarded != request)
+        ESP_LOGV(TAG, "Relayed 0x%08lX rewritten to 0x%08lX -> 0x%08lX", request, forwarded, response);
+      else
+        ESP_LOGV(TAG, "Relayed 0x%08lX -> 0x%08lX", request, response);
 
       if (msg_type == OpenThermMessageType::WRITE_DATA)
         instance_->logThermostatWrite(request);
